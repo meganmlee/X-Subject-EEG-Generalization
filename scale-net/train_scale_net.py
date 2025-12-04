@@ -652,14 +652,14 @@ if __name__ == "__main__":
         'lr': args.lr,
         # STFT params will use task-specific defaults from TASK_CONFIGS
         'cnn_filters': 16,
-        'lstm_hidden': 64,
+        'lstm_hidden': 128,
         'pos_dim': 16,
         'dropout': 0.3,
         'cnn_dropout': 0.2,
         'use_hidden_layer': True,
-        'hidden_dim': 128,
+        'hidden_dim': 64,
         'weight_decay': 1e-4,
-        'patience': 20,
+        'patience': 15,
         'scheduler': 'ReduceLROnPlateau',
         'seed': 44,
     }
