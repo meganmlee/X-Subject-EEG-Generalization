@@ -5,6 +5,7 @@ This framework, Spectral Convolutional Attention (SE) LSTM Encoder (SCALE-Net), 
 
 To train (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
 
+      cd scale-net
       python -m train_scale_net —task [task name]
       
 To test (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
