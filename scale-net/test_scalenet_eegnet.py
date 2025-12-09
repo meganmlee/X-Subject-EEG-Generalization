@@ -11,7 +11,7 @@ import argparse
 from sklearn.metrics import confusion_matrix
 
 # Import model and dataset functions from model_cldnn_se.py
-from train_scale_net import ChannelWiseSpectralCLDNN
+from train_scale_net_temp import ChannelWiseSpectralCLDNN_Dual
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders, get_stft_dimensions
 
 
@@ -39,8 +39,9 @@ def evaluate(model, loader, device, is_binary=False):
     
     with torch.no_grad():
         for inputs, labels in tqdm(loader, desc='Evaluating', ncols=100):
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
+            x_time, x_spec = inputs
+            x_time, x_spec, labels = x_time.to(device), x_spec.to(device), labels.to(device)
+            outputs = model(x_time, x_spec)
             
             # Prediction: binary uses sigmoid threshold, multi-class uses argmax
             if is_binary:
@@ -212,16 +213,22 @@ def test_task(task, checkpoint_path, batch_size, checkpoint_dir='./checkpoints')
     test1_loader = loaders.get('test1')
     test2_loader = loaders.get('test2')
     
+    sample_x, _ = next(iter(val_loader))
+    sample_x_time, sample_x_spec = sample_x
+    _, n_channels, T_raw = sample_x_time.shape
+    _, _, freq_bins, time_bins = sample_x_spec.shape
+    print(f"Input Data Dimensions: Raw Time={T_raw}, Freq={freq_bins}, TimeBins={time_bins}, Channels={n_channels}")
     
     # 3. Create Model and Load Checkpoint
     n_classes = config['n_classes']
     is_binary = (n_classes == 2)
     
-    model = ChannelWiseSpectralCLDNN(
+    model = ChannelWiseSpectralCLDNN_Dual(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,
         n_classes=n_classes,
+        T_raw=T_raw,
         cnn_filters=config['cnn_filters'],
         lstm_hidden=config['lstm_hidden'],
         pos_dim=config['pos_dim'],
@@ -296,7 +303,7 @@ def main_test_all(tasks, checkpoint_dir, batch_size):
     
     for task in tasks:
         # Construct the standardized checkpoint path
-        task_lower = task.lower().replace('_', '') # e.g., imagined_speech -> imaginedspeech
+        task_lower = task.lower()# e.g., imagined_speech -> imaginedspeech
         checkpoint_path = os.path.join(checkpoint_dir, f'best_{task_lower}_model.pth')
         
         # Call the testing function for the task
@@ -364,7 +371,7 @@ if __name__ == "__main__":
     else:
         # Run a single task
         # Construct the checkpoint path based on the task name
-        task_lower = args.task.lower().replace('_', '')
+        task_lower = args.task.lower()
         checkpoint_name = f'best_{task_lower}_model.pth'
         checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_name)
         
