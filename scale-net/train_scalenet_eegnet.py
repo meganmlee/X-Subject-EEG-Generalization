@@ -49,158 +49,180 @@ class SqueezeExcitation(nn.Module):
         y = self.excitation(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
-class ChannelWiseSpectralCLDNN(nn.Module):
+class ChannelWiseSpectralCLDNN_Dual(nn.Module):
     """
-    Channel-wise Spectral CNN-LSTM-DNN model
+    Channel-wise Spectral + Time CLDNN model (Dual Stream)
+    
+    Inputs:
+        x_time: (B, C, T_raw) - Raw temporal EEG data
+        x_spec: (B, C, F, T) - STFT features
     """
     
-    def __init__(self, freq_bins, time_bins, n_channels, n_classes, 
+    def __init__(self, freq_bins, time_bins, n_channels, n_classes, T_raw,
                  cnn_filters=16, lstm_hidden=128, pos_dim=16,
-                 dropout=0.3, cnn_dropout=0.2,
-                 use_hidden_layer=False, hidden_dim=64):
-        """
-        Args:
-            dropout: Dropout rate for LSTM output and classifier (default: 0.3)
-            cnn_dropout: Dropout rate for CNN layers (default: 0.2)
-            use_hidden_layer: Whether to add a hidden dense layer after LSTM (default: False)
-            hidden_dim: Dimension of hidden layer if use_hidden_layer=True (default: 64)
-        """
+                 dropout=0.3, cnn_dropout=0.2, use_hidden_layer=False, hidden_dim=64):
+        
         super().__init__()
-        print(f"[CLDNN init] freq_bins={freq_bins}, time_bins={time_bins}, n_channels={n_channels}")
         self.n_channels = n_channels
-        self.freq_bins = freq_bins
-        self.time_bins = time_bins
+        self.T_raw = T_raw
         
-        # ====== Per-channel CNN with SE Block (weight sharing) ======
+        # ====== SPECTRAL STREAM (2D CNN) - Same as original model ======
+        self.spec_cnn_filters = cnn_filters * 2
         
-        # Stage 1: Conv(1→16) + SE + Pool
-        self.conv1 = nn.Conv2d(1, cnn_filters, kernel_size=7, padding=3, bias=False)
-        # self.conv1 = nn.Conv2d(1, cnn_filters, kernel_size=(5, 3), padding=(2, 1), bias=False)
-        self.bn1 = nn.BatchNorm2d(cnn_filters)
-        self.se1 = SqueezeExcitation(cnn_filters, reduction=4)
-        self.dropout_cnn1 = nn.Dropout2d(cnn_dropout)  # Spatial dropout for CNN
-        self.pool1 = nn.MaxPool2d(2)  # (F, T) → (F/2, T/2)
-        # self.pool1 = nn.MaxPool2d((2, 1))  # (F, T) → (F/2, T/2)
+        # Stage 1: Conv(1→16) + BN + ReLU + SE + Dropout + Pool
+        self.spec_conv1 = nn.Conv2d(1, cnn_filters, kernel_size=7, padding=3, bias=False)
+        self.spec_bn1 = nn.BatchNorm2d(cnn_filters)
+        self.spec_se1 = SqueezeExcitation(cnn_filters, reduction=4)
+        self.spec_dropout_cnn1 = nn.Dropout2d(cnn_dropout)
+        self.spec_pool1 = nn.MaxPool2d(2)  # (F, T) → (F/2, T/2)
         
-        # Stage 2: Conv(16→32) + SE + Pool
-        self.conv2 = nn.Conv2d(cnn_filters, cnn_filters * 2, kernel_size=5, padding=2, bias=False)
-        # self.conv2 = nn.Conv2d(cnn_filters, cnn_filters * 2, kernel_size=(5, 3), padding=(2, 1), bias=False)
-        self.bn2 = nn.BatchNorm2d(cnn_filters * 2)
-        self.se2 = SqueezeExcitation(cnn_filters * 2, reduction=4)
-        self.dropout_cnn2 = nn.Dropout2d(cnn_dropout)  # Spatial dropout for CNN
-        self.pool2 = nn.MaxPool2d(2)  # (F/2, T/2) → (F/4, T/4)
-        # self.pool2 = nn.MaxPool2d((2, 1))  # (F/2, T/2) → (F/4, T/4)
+        # Stage 2: Conv(16→32) + BN + ReLU + SE + Dropout + Pool
+        self.spec_conv2 = nn.Conv2d(cnn_filters, self.spec_cnn_filters, kernel_size=5, padding=2, bias=False)
+        self.spec_bn2 = nn.BatchNorm2d(self.spec_cnn_filters)
+        self.spec_se2 = SqueezeExcitation(self.spec_cnn_filters, reduction=4)
+        self.spec_dropout_cnn2 = nn.Dropout2d(cnn_dropout)
+        self.spec_pool2 = nn.MaxPool2d(2)  # (F/2, T/2) → (F/4, T/4)
         
-        # CNN 출력 차원 계산 (2번 pooling 적용: freq와 time 모두 2로 나눔)
-        # pooling 2번: (F, T) → (F/2, T/2) → (F/4, T/4)
-        self.cnn_out_dim = (freq_bins // 4) * (time_bins // 4) * (cnn_filters * 2)
+        # Spectral CNN Output Dimension
+        self.spec_out_dim = (freq_bins // 4) * (time_bins // 4) * self.spec_cnn_filters
         
-        # ====== Channel Position Embedding ======
+        # ====== TEMPORAL STREAM (EEGNet Inspired) ======
+        F1 = 8  # F1 filters per temporal kernel
+        D = 2   # Depth multiplier (Spatial filters per temporal filter)
+        F2 = F1 * D
+        
+        # Layer 1: Temporal Conv (Kernels along Time)
+        # Input: (B, 1, C, T) -> Output: (B, F1, C, T)
+        self.temp_conv = nn.Conv2d(1, F1, (1, 64), padding=(0, 32), bias=False)
+        self.bn_temp = nn.BatchNorm2d(F1)
+        
+        # Layer 2: Spatial Conv (Kernels along Channels)
+        # Input: (B, F1, C, T) -> Output: (B, F2, 1, T)
+        # GROUPS=F1 makes this a Depthwise convolution (crucial for EEGNet)
+        self.spatial_conv = nn.Conv2d(F1, F2, (n_channels, 1), groups=F1, bias=False)
+        self.bn_spatial = nn.BatchNorm2d(F2)
+        self.pool_spatial = nn.AvgPool2d((1, 4)) # Pool time by 4
+        
+        # Layer 3: Separable Conv
+        self.separable_conv = nn.Sequential(
+            nn.Conv2d(F2, F2, (1, 16), padding=(0, 8), groups=F2, bias=False), # Depthwise
+            nn.Conv2d(F2, F2, (1, 1), bias=False), # Pointwise
+            nn.BatchNorm2d(F2),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d((1, 8)), # Pool time aggressively
+            nn.Dropout(cnn_dropout)
+        )
+        
+        # Calculate dimension after flattening the temporal stream
+        # This vector represents the "Global Context" of the trial
+        final_time_dim = (T_raw // 4) // 8 
+        self.time_out_dim = F2 * final_time_dim
+
+        # ====== FUSION ======
+        # We will concatenate the Global Temporal features to *each* spectral channel channel
+        self.fused_out_dim = self.spec_out_dim + self.time_out_dim
+
+        # Channel Position Embedding
         self.chan_emb = nn.Embedding(n_channels, pos_dim)
-        self.pos_projection = nn.Linear(pos_dim, self.cnn_out_dim)
+        # Projection now maps just the Position Embedding to match fused dimension?
+        # Actually, let's project the Pos Embedding to add to the Spec stream only, 
+        # or project the fused result. Let's keep it simple:
         
-        # ====== LSTM across channels ======
-        # Note: LSTM dropout parameter only works with num_layers > 1
-        # For single-layer LSTM, we apply dropout after LSTM output
+        self.fusion_projection = nn.Linear(self.fused_out_dim, lstm_hidden)
+
+        # LSTM
         self.lstm = nn.LSTM(
-            input_size=self.cnn_out_dim,
+            input_size=lstm_hidden, # Projected dimension
             hidden_size=lstm_hidden,
             batch_first=True,
             bidirectional=False,
-            dropout=0  # Single-layer LSTM doesn't support dropout parameter
+            dropout=0 
         )
-        
-        # Dropout after LSTM output
         self.dropout_lstm = nn.Dropout(dropout)
         
-        # ====== Optional Hidden Layer ======
+        # Classifier
         self.use_hidden_layer = use_hidden_layer
         if use_hidden_layer:
             self.hidden_layer = nn.Sequential(
                 nn.Linear(lstm_hidden, hidden_dim),
                 nn.ReLU(inplace=True),
-                nn.Dropout(dropout)  # Additional dropout for regularization
+                nn.Dropout(dropout)
             )
-            classifier_input_dim = hidden_dim
+            classifier_input = hidden_dim
         else:
-            classifier_input_dim = lstm_hidden
-        
-        # ====== Classifier ======
-        # Binary classification (n_classes=2): use single output for BCEWithLogitsLoss
-        # Multi-class classification: use n_classes outputs for CrossEntropyLoss
-        self.is_binary = (n_classes == 2)
-        if self.is_binary:
-            self.classifier = nn.Linear(classifier_input_dim, 1)  # Single output for binary
-        else:
-            self.classifier = nn.Linear(classifier_input_dim, n_classes)
-        
+            classifier_input = lstm_hidden
+            
+        self.classifier = nn.Linear(classifier_input, 1 if n_classes==2 else n_classes)
         self._init_weights()
-    
+
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-    
-    def forward(self, x, chan_ids: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: (B, C, F, T) - Batch, Channels, Freq, Time
-            chan_ids: Optional channel indices (default: 0 to C-1)
-            
-        Returns:
-            (B, n_classes) - Classification logits
-        """
-        B, C, Fr, T = x.shape  # Fr: Frequency (avoid shadowing F = torch.nn.functional)
+
+    def forward(self, x_time, x_spec, chan_ids: Optional[torch.Tensor] = None):
+        B, C, _, _ = x_spec.shape
+        _, _, T_raw = x_time.shape
+
+        # ====== 1. SPECTRAL STREAM (2D CNN) ======
+        # (B, C, F, T) → (B*C, 1, F, T)
+        x_spec = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
         
-        if C != self.n_channels:
-            raise ValueError(f"Expected {self.n_channels} channels, got {C}")
+        # Stage 1
+        x_spec = self.spec_conv1(x_spec); x_spec = self.spec_bn1(x_spec); x_spec = F.relu(x_spec, inplace=True)
+        x_spec = self.spec_se1(x_spec); x_spec = self.spec_dropout_cnn1(x_spec); x_spec = self.spec_pool1(x_spec)
         
-        # ====== Step 1: Per-channel CNN with SE Block ======
-        # (B, C, Fr, T) → (B*C, 1, Fr, T) - 각 채널을 개별 이미지로
-        x = x.view(B * C, 1, Fr, T)
+        # Stage 2
+        x_spec = self.spec_conv2(x_spec); x_spec = self.spec_bn2(x_spec); x_spec = F.relu(x_spec, inplace=True)
+        x_spec = self.spec_se2(x_spec); x_spec = self.spec_dropout_cnn2(x_spec); x_spec = self.spec_pool2(x_spec)
         
-        # Stage 1: Conv → BN → ReLU → SE → Dropout → Pool
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = F.relu(x, inplace=True)
-        x = self.se1(x)
-        x = self.dropout_cnn1(x)  # Spatial dropout
-        x = self.pool1(x)  # (B*C, 16, F/2, T/2)
+        x_spec = x_spec.view(B, C, -1)  # (B, C, spec_out_dim)
+
+        # ====== 2. TEMPORAL STREAM (1D CNN) ======
+        # Input: (B, C, T) -> (B, 1, C, T) to use 2D Spatial Conv
+        x_global = x_time.unsqueeze(1) 
         
-        # Stage 2: Conv → BN → ReLU → SE → Dropout → Pool
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = F.relu(x, inplace=True)
-        x = self.se2(x)
-        x = self.dropout_cnn2(x)  # Spatial dropout
-        x = self.pool2(x)  # (B*C, 32, F/4, T/4)
+        x_global = self.temp_conv(x_global)
+        x_global = self.bn_temp(x_global)
         
-        # Flatten
-        x = x.view(B, C, -1)  # (B, C, cnn_out_dim)
+        # Crucial Step: Spatial Conv reduces C dimension to 1
+        x_global = self.spatial_conv(x_global) 
+        x_global = F.relu(self.bn_spatial(x_global))
+        x_global = self.pool_spatial(x_global)
         
-        # ====== Step 2: Add channel position embedding (Transformer-style Addition) ======
+        x_global = self.separable_conv(x_global)
+        
+        # Flatten: (B, F2, 1, T_small) -> (B, F2*T_small)
+        x_global = x_global.view(B, -1)
+        
+        # ====== 3. FEATURE FUSION and LSTM ======
+        # Repeat global vector for every channel: (B, T_dim) -> (B, C, T_dim)
+        x_global_expanded = x_global.unsqueeze(1).expand(-1, C, -1)
+        
+        # Concatenate: (B, C, S_dim + T_dim)
+        features = torch.cat([x_spec, x_global_expanded], dim=2)
+        
+        # Project to reasonable size before LSTM
+        features = self.fusion_projection(features)
+        
+        # Add Position Embeddings (Transformer style addition)
         if chan_ids is None:
-            chan_ids = torch.arange(C, device=x.device).unsqueeze(0).expand(B, C)
+            chan_ids = torch.arange(C, device=features.device).unsqueeze(0).expand(B, C)
+        pos = self.chan_emb(chan_ids) # (B, C, pos_dim)
         
-        pos = self.chan_emb(chan_ids)           # (B, C, pos_dim)
-        pos = self.pos_projection(pos)          # (B, C, cnn_out_dim) - projection to match x
-        x = x + pos                             # Addition instead of concat (Transformer-style)
-        
-        # ====== Step 3: LSTM across channels ======
-        _, (h, _) = self.lstm(x)  # h: (1, B, lstm_hidden)
-        h = h.squeeze(0)  # (B, lstm_hidden)
-        h = self.dropout_lstm(h)  # Dropout after LSTM
-        
-        # ====== Step 4: Optional Hidden Layer ======
+        # LSTM Aggregation
+        _, (h, _) = self.lstm(features)
+        h = h.squeeze(0)
+        h = self.dropout_lstm(h)
+
         if self.use_hidden_layer:
-            h = self.hidden_layer(h)  # (B, hidden_dim)
+            h = self.hidden_layer(h)
         
-        # ====== Step 5: Classify ======
-        return self.classifier(h)  # (B, n_classes)
+        return self.classifier(h)
 
 # ==================== Multi-GPU Setup ====================
 
@@ -241,7 +263,8 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     
     pbar = tqdm(loader, desc='Train', ncols=100)
     for inputs, labels in pbar:
-        inputs, labels = inputs.to(device), labels.to(device)
+        x_time, x_spec = inputs
+        x_time, x_spec, labels = x_time.to(device), x_spec.to(device), labels.to(device)
         
         # Convert labels for binary classification
         if is_binary:
@@ -250,7 +273,7 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
             labels_float = labels
         
         optimizer.zero_grad()
-        outputs = model(inputs)
+        outputs = model(x_time, x_spec)
         loss = criterion(outputs, labels_float)
         
         loss.backward()
@@ -281,7 +304,8 @@ def evaluate(model, loader, device, criterion=None, is_binary=False):
     
     with torch.no_grad():
         for inputs, labels in tqdm(loader, desc='Eval', ncols=100):
-            inputs, labels = inputs.to(device), labels.to(device)
+            x_time, x_spec = inputs
+            x_time, x_spec, labels = x_time.to(device), x_spec.to(device), labels.to(device)
             
             # Convert labels for binary classification
             if is_binary:
@@ -289,7 +313,7 @@ def evaluate(model, loader, device, criterion=None, is_binary=False):
             else:
                 labels_float = labels
             
-            outputs = model(inputs)
+            outputs = model(x_time, x_spec)
             if criterion is not None:
                 loss = criterion(outputs, labels_float)
                 total_loss += loss.item()
@@ -417,17 +441,20 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     test2_loader = loaders.get('test2')
     
     # Get dimensions from a sample
-    sample_x, _ = next(iter(train_loader))
-    _, n_channels, freq_bins, time_bins = sample_x.shape
+    sample_x, _ = next(iter(train_loader)) # Now returns (x_time, x_spec), labels
+    sample_x_time, sample_x_spec = sample_x
+    _, n_channels, T_raw = sample_x_time.shape # Get T_raw from the first element
+    _, _, freq_bins, time_bins = sample_x_spec.shape
     print(f"STFT shape: ({n_channels}, {freq_bins}, {time_bins})")
     
     # ====== Create Model ======
     n_classes = config['n_classes']
-    model = ChannelWiseSpectralCLDNN(
+    model = ChannelWiseSpectralCLDNN_Dual(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,
         n_classes=n_classes,
+        T_raw=T_raw,
         cnn_filters=config['cnn_filters'],
         lstm_hidden=config['lstm_hidden'],
         pos_dim=config['pos_dim'],
